@@ -1,0 +1,17 @@
+# Dependencies & Node
+node_modules/
+package-lock.json
+package.json
+
+# Scratch & temporary scripts
+scratch/
+*.log
+*.tmp
+__pycache__/
+
+# Operating system artifacts
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
