@@ -11,6 +11,7 @@ import sys
 import csv
 import json
 import pandas as pd
+from collections import defaultdict
 
 # UTF-8 stdout configuration for Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -26,6 +27,11 @@ def build_dashboard():
     df_leads = pd.read_csv(leads_csv_path)
     print(f"Loaded {len(df_leads):,} lead records.")
     lead_ids_set = set(df_leads['Lead ID'].dropna().astype(str).tolist())
+    day_precision_events = {
+        (str(row['Lead ID']), str(row['Occurred At (IST)']), str(row['Activity']), str(row['Activity Code']), str(row['Performed By']))
+        for _, row in df_act.iterrows()
+        if str(row.get('Time Precision', '')).strip().lower() == 'day'
+    }
 
     print(f"Loading activities from: {act_csv_path}")
     df_act = pd.read_csv(act_csv_path, low_memory=False)
@@ -42,12 +48,16 @@ def build_dashboard():
         if lid and lid in lead_ids_set:
             clean_events = []
             for ev in item.get('events', []):
+                event_at = ev.get('at', '')
+                event_key = (str(lid), str(event_at or ''), str(ev.get('type') or ''), str(ev.get('code') or ''), str(ev.get('by') or ''))
+                if event_key in day_precision_events:
+                    event_at = str(event_at).split(' ')[0]
                 clean_events.append({
-                    'at': ev.get('at', ''),
+                    'at': event_at,
                     'type': ev.get('type', ''),
                     'code': ev.get('code', ''),
                     'by': ev.get('by', ''),
-                    'text': (ev.get('text') or ev.get('note') or '')[:300],
+                    'text': (ev.get('text') or ev.get('note') or ''),
                     'duration': ev.get('duration'),
                     'outcome': ev.get('outcome')
                 })
@@ -213,7 +223,7 @@ def build_dashboard():
             course_fee,                                    # 9: course_fee_inr
             fee_paid,                                      # 10: fee_paid_inr
             calls_made,                                    # 11: total_calls
-            int(talk_mins),                                # 12: total_talk_time_mins
+            float(talk_mins),                             # 12: total_talk_time_mins
             fol_map.get(fol_st, 0),                        # 13: followup_status
             b_type,                                        # 14: batch_type
             lid_num,                                       # 15: lead_num
@@ -234,8 +244,9 @@ def build_dashboard():
     # Extract clean call activities from df_act for counsellor cadence and call logs
     df_calls = df_act[df_act['Activity'] == 'Outgoing call'].copy()
     call_records = []
-    for _, cr in df_calls.head(3000).iterrows():
+    for _, cr in df_calls.iterrows():
         call_records.append({
+            'lead_id': str(cr.get('Lead ID', '')),
             'date': str(cr.get('Date', '')),
             'time': str(cr.get('Time', '')),
             'by': str(cr.get('Performed By', '')),
@@ -244,6 +255,112 @@ def build_dashboard():
             'lead': str(cr.get('Lead Name', '')),
             'course': str(cr.get('Course', '')),
             'phone': str(cr.get('Phone', ''))
+        })
+
+    # Associate each user-authored CRM note with one earlier connected call
+    # from the same lead and counsellor. Incoming and outgoing calls qualify;
+    # missed calls do not. No time threshold is applied.
+    def clean_cell(value):
+        return '' if pd.isna(value) else str(value)
+
+    audit_events = []
+    for source_order, (_, ar) in enumerate(df_act.iterrows()):
+        activity = clean_cell(ar.get('Activity', ''))
+        lead_id = clean_cell(ar.get('Lead ID', ''))
+        counsellor = clean_cell(ar.get('Performed By', ''))
+        occurred_at = clean_cell(ar.get('Occurred At (IST)', ''))
+        activity_id = ar.get('Activity ID', 0)
+        try:
+            activity_id = int(activity_id) if pd.notna(activity_id) else 0
+        except (TypeError, ValueError):
+            activity_id = 0
+
+        if activity in ('Outgoing call', 'Incoming call'):
+            outcome = clean_cell(ar.get('Call Outcome', ''))
+            connected = clean_cell(ar.get('Connected', '')).strip().lower() == 'yes'
+            if outcome == 'CONNECTED' or connected:
+                call_record = {
+                    'call_id': clean_cell(ar.get('Activity ID', '')),
+                    'lead_id': lead_id,
+                    'at': occurred_at.split(' ')[0] if str(ar.get('Time Precision', '')).strip().lower() == 'day' else occurred_at,
+                    'date': clean_cell(ar.get('Date', '')),
+                    'time': clean_cell(ar.get('Time', '')),
+                    'by': counsellor,
+                    'activity': activity,
+                    'course': clean_cell(ar.get('Course', '')),
+                    'phone': clean_cell(ar.get('Phone', '')),
+                    'written': False,
+                    'note_at': '',
+                    'note_text': ''
+                }
+                audit_events.append((occurred_at, activity_id, source_order, 'call', call_record))
+        elif activity == 'Note':
+            note_text = ar.get('Message / Note', '')
+            if pd.notna(note_text) and str(note_text).strip():
+                audit_events.append((occurred_at, activity_id, source_order, 'note', {
+                    'lead_id': lead_id,
+                    'by': counsellor,
+                    'at': occurred_at,
+                    'text': clean_cell(note_text).strip()
+                }))
+
+    pending_connected_calls = defaultdict(list)
+    for _, _, _, event_kind, event in sorted(audit_events, key=lambda item: (item[0], item[1], item[2])):
+        group_key = (event['lead_id'], event['by'])
+        if event_kind == 'call':
+            pending_connected_calls[group_key].append(event)
+        elif pending_connected_calls[group_key]:
+            matched_call = pending_connected_calls[group_key].pop()
+            matched_call['written'] = True
+            matched_call['note_at'] = event['at']
+            matched_call['note_text'] = event.get('text', '')
+
+    note_call_records = [
+        event for _, _, _, event_kind, event in sorted(audit_events, key=lambda item: (item[0], item[1], item[2]))
+        if event_kind == 'call'
+    ]
+
+    # Keep source-backed call and WhatsApp activity counts available to the
+    # dashboard, including incoming and missed calls.
+    counted_activity_types = {
+        'Outgoing call', 'Incoming call', 'Missed incoming call',
+        'WhatsApp sent', 'WhatsApp received'
+    }
+    activity_event_records = []
+    for _, ar in df_act.iterrows():
+        activity = clean_cell(ar.get('Activity', ''))
+        if activity not in counted_activity_types:
+            continue
+        outcome = clean_cell(ar.get('Call Outcome', ''))
+        connected = clean_cell(ar.get('Connected', '')).strip().lower() == 'yes' or outcome == 'CONNECTED'
+        duration = ar.get('Duration (sec)', 0)
+        activity_event_records.append({
+            'activity': activity,
+            'date': clean_cell(ar.get('Date', '')),
+            'at': clean_cell(ar.get('Occurred At (IST)', '')).split(' ')[0] if clean_cell(ar.get('Time Precision', '')).strip().lower() == 'day' else clean_cell(ar.get('Occurred At (IST)', '')),
+            'by': clean_cell(ar.get('Performed By', '')),
+            'lead_id': clean_cell(ar.get('Lead ID', '')),
+            'course': clean_cell(ar.get('Course', '')),
+            'connected': connected,
+            'outcome': outcome,
+            'dur_sec': int(float(duration)) if pd.notna(duration) else 0
+        })
+
+    # Preserve assignment timestamps separately for the 30-minute first-call SLA.
+    # The lead export does not contain an assignment timestamp; the activity
+    # export does for the subset of leads with an Assignment event.
+    assignment_records = []
+    for _, ar in df_act.iterrows():
+        if clean_cell(ar.get('Activity', '')) != 'Assignment':
+            continue
+        lead_id = clean_cell(ar.get('Lead ID', ''))
+        assigned_at = clean_cell(ar.get('Occurred At (IST)', ''))
+        if not lead_id or not assigned_at:
+            continue
+        assignment_records.append({
+            'lead_id': lead_id,
+            'at': assigned_at,
+            'assignee': clean_cell(ar.get('Assignee', ''))
         })
 
     payload = {
@@ -265,7 +382,10 @@ def build_dashboard():
         },
         'data': encoded_rows,
         'journeys': lead_journeys,
-        'calls': call_records
+        'calls': call_records,
+        'noteCalls': note_call_records,
+        'activityEvents': activity_event_records,
+        'assignments': assignment_records
     }
 
     json_payload = json.dumps(payload, separators=(',', ':'))
@@ -301,7 +421,7 @@ def build_dashboard():
       let authenticSlaStatus = 'N/A';
       let authenticSlaTurnaround = rawSlaMinutes;
       if (rawSlaMinutes !== null) {
-        authenticSlaStatus = (rawSlaMinutes <= 20) ? 'Met' : 'Breach';
+        authenticSlaStatus = (rawSlaMinutes <= 30) ? 'Met' : 'Breach';
       } else if (st === 'New Lead') {
         authenticSlaStatus = 'Pending';
       }

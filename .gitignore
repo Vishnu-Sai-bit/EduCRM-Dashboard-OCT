@@ -9,6 +9,13 @@ scratch/
 *.tmp
 __pycache__/
 
+# Duplicate and superseded dashboard iterations
+EduCRM_Counsellor_Dashboard.html
+EduCRM_Improved_Dashboard.html
+
+# Bloated / duplicate CSVs (exceeds 100MB GitHub limit)
+telecrm-activities-2026-10-01_to_2026-10-31-with-automation.csv
+
 # Operating system artifacts
 Thumbs.db
 ehthumbs.db
